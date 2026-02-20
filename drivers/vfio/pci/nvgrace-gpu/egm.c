@@ -7,6 +7,7 @@
 #include <linux/nvgrace-egm.h>
 #include <linux/egm.h>
 #include <linux/memory-failure.h>
+#include "egm.h"
 
 #define MAX_EGM_NODES 4
 
@@ -25,9 +26,11 @@ struct chardev {
 	atomic_t open_count;
 	DECLARE_HASHTABLE(htbl, 0x10);
 	struct pfn_address_space pfn_address_space;
+	struct mutex dmabuf_lock;
+	struct list_head dmabufs;
 };
 
-static struct nvgrace_egm_dev *
+struct nvgrace_egm_dev *
 egm_chardev_to_nvgrace_egm_dev(struct chardev *egm_chardev)
 {
 	struct auxiliary_device *aux_dev =
@@ -227,14 +230,13 @@ static long nvgrace_egm_ioctl(struct file *file, unsigned int cmd, unsigned long
 	void __user *uarg = (void __user *)arg;
 	struct chardev *egm_chardev = file->private_data;
 
-	if (copy_from_user(&info, uarg, minsz))
-		return -EFAULT;
-
-	if (info.argsz < minsz || !egm_chardev)
-		return -EINVAL;
+	if (!egm_chardev)
+		return -ENODEV;
 
 	switch (cmd) {
-	case EGM_RETIRED_PAGES_LIST:
+	case EGM_EXPORT_DMABUF:
+		return nvgrace_egm_export_dmabuf(egm_chardev, uarg);
+	case EGM_RETIRED_PAGES_LIST: {
 		int ret;
 		unsigned long retired_page_struct_size = sizeof(struct egm_retired_pages_info);
 		struct egm_retired_pages_info tmp;
@@ -242,6 +244,12 @@ static long nvgrace_egm_ioctl(struct file *file, unsigned int cmd, unsigned long
 		struct hlist_node *tmp_node;
 		unsigned long bkt;
 		int count = 0, index = 0;
+
+		if (copy_from_user(&info, uarg, minsz))
+			return -EFAULT;
+
+		if (info.argsz < minsz)
+			return -EINVAL;
 
 		hash_for_each_safe(egm_chardev->htbl, bkt, tmp_node, cur_page, node)
 			count++;
@@ -277,6 +285,7 @@ static long nvgrace_egm_ioctl(struct file *file, unsigned int cmd, unsigned long
 			info.count = index;
 		}
 		break;
+	}
 	default:
 		return -EINVAL;
 	}
@@ -324,6 +333,8 @@ setup_egm_chardev(struct nvgrace_egm_dev *egm_dev)
 	cdev_init(&egm_chardev->cdev, &file_ops);
 	egm_chardev->cdev.owner = THIS_MODULE;
 	atomic_set(&egm_chardev->open_count, 0);
+	mutex_init(&egm_chardev->dmabuf_lock);
+	INIT_LIST_HEAD(&egm_chardev->dmabufs);
 
 	ret = dev_set_name(&egm_chardev->device, "egm%lld", egm_dev->egmpxm);
 	if (ret)
@@ -440,6 +451,7 @@ static void egm_driver_remove(struct auxiliary_device *aux_dev)
 	if (!egm_chardev)
 		return;
 
+	nvgrace_egm_dma_buf_cleanup(egm_chardev);
 	cleanup_retired_pages(egm_chardev);
 	del_egm_chardev(egm_chardev);
 }

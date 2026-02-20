@@ -23,6 +23,20 @@ struct egm_retired_pages_list {
 	struct egm_retired_pages_info retired_pages[];
 };
 
+struct egm_dma_range {
+	__aligned_u64 offset;
+	__aligned_u64 length;
+};
+
+struct egm_dma_buf_export {
+	__u32 argsz;
+	__u32 flags;
+	__u32 nr_ranges;
+	__u32 open_flags;
+	struct egm_dma_range dma_ranges[];
+};
+
 #define EGM_RETIRED_PAGES_LIST     _IO(EGM_TYPE, 100)
+#define EGM_EXPORT_DMABUF          _IOWR(EGM_TYPE, 101, struct egm_dma_buf_export)
 
 #endif /* _UAPIEGM_H */
