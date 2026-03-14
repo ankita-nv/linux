@@ -11,12 +11,57 @@
 static dev_t dev;
 static struct class *class;
 
+struct nvgrace_egm_dev {
+	u64 egmpxm;
+};
+
+struct nvgrace_egm_dev_entry {
+	struct list_head list;
+	struct nvgrace_egm_dev *egm_dev;
+};
+
+/*
+ * Track egm device lists. Note that there is one device per socket.
+ * All the GPUs belonging to the same sockets are associated with
+ * the EGM device for that socket.
+ */
+static LIST_HEAD(egm_chardevs);
+
 static char *egm_devnode(const struct device *device, umode_t *mode)
 {
 	if (mode)
 		*mode = 0600;
 
 	return NULL;
+}
+
+/*
+ * Determine if the EGM feature is enabled. If disabled, there
+ * will be no EGM properties populated in the ACPI tables and this
+ * fetch would fail.
+ */
+static int has_egm_property(struct pci_dev *pdev, u64 *pegmpxm)
+{
+	return device_property_read_u64(&pdev->dev, "nvidia,egm-pxm",
+					pegmpxm);
+}
+
+static bool is_duplicate_egm_entry(u64 egmpxm)
+{
+	struct nvgrace_egm_dev_entry *egm_entry;
+
+	list_for_each_entry(egm_entry, &egm_chardevs, list) {
+		/*
+		 * A system could have multiple GPUs associated with an
+		 * EGM region and will have the same set of EGM region
+		 * information. Skip the EGM region information fetch if
+		 * already done through a different GPU on the same socket.
+		 */
+		if (egm_entry->egm_dev->egmpxm == egmpxm)
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -27,20 +72,33 @@ static char *egm_devnode(const struct device *device, umode_t *mode)
  */
 static int nvgrace_egm_create_pci_egm_devs(void)
 {
+	struct nvgrace_egm_dev_entry *egm_entry;
+	struct nvgrace_egm_dev *egm_dev;
 	struct pci_dev *pdev = NULL;
 
 	for_each_pci_dev(pdev) {
 		u64 egmpxm;
 
-		/*
-		 * EGM is an optional feature controlled by SBIOS. If it is
-		 * disabled, the companion ACPI object will not carry the
-		 * "nvidia,egm-pxm" property and the read will fail. Treat
-		 * that as a non-fatal absence and skip to the next device.
-		 */
-		if (device_property_read_u64(&pdev->dev, "nvidia,egm-pxm",
-					     &egmpxm))
+		if (has_egm_property(pdev, &egmpxm))
 			continue;
+
+		if (is_duplicate_egm_entry(egmpxm))
+			continue;
+
+		egm_entry = kzalloc(sizeof(*egm_entry), GFP_KERNEL);
+		if (!egm_entry)
+			return -ENOMEM;
+
+		egm_dev = kzalloc(sizeof(*egm_dev), GFP_KERNEL);
+		if (!egm_dev) {
+			kfree(egm_entry);
+			return -ENOMEM;
+		}
+
+		egm_dev->egmpxm = egmpxm;
+		egm_entry->egm_dev = egm_dev;
+
+		list_add_tail(&egm_entry->list, &egm_chardevs);
 	}
 
 	return 0;
@@ -48,6 +106,13 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 
 static void nvgrace_egm_destroy_pci_devs(void)
 {
+	struct nvgrace_egm_dev_entry *entry, *tmp;
+
+	list_for_each_entry_safe(entry, tmp, &egm_chardevs, list) {
+		list_del(&entry->list);
+		kfree(entry->egm_dev);
+		kfree(entry);
+	}
 }
 
 static int __init nvgrace_egm_init(void)
