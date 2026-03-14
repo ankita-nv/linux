@@ -12,6 +12,8 @@ static dev_t dev;
 static struct class *class;
 
 struct nvgrace_egm_dev {
+	struct device device;
+	struct cdev cdev;
 	u64 egmpxm;
 };
 
@@ -26,6 +28,80 @@ struct nvgrace_egm_dev_entry {
  * the EGM device for that socket.
  */
 static LIST_HEAD(egm_chardevs);
+
+static int nvgrace_egm_open(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static int nvgrace_egm_release(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static int nvgrace_egm_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	return 0;
+}
+
+static const struct file_operations file_ops = {
+	.owner = THIS_MODULE,
+	.open = nvgrace_egm_open,
+	.release = nvgrace_egm_release,
+	.mmap = nvgrace_egm_mmap,
+};
+
+static void egm_chardev_release(struct device *dev)
+{
+	struct nvgrace_egm_dev *egm_chardev = container_of(dev, struct nvgrace_egm_dev, device);
+
+	kfree(egm_chardev);
+}
+
+static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmpxm)
+{
+	struct nvgrace_egm_dev *egm_chardev;
+	int ret;
+
+	egm_chardev = kzalloc(sizeof(*egm_chardev), GFP_KERNEL);
+	if (!egm_chardev)
+		goto create_err;
+
+	device_initialize(&egm_chardev->device);
+
+	/*
+	 * Use the proximity domain number as the device minor
+	 * number. So the EGM corresponding to node X would be
+	 * /dev/egmX.
+	 */
+	egm_chardev->egmpxm = egmpxm;
+	egm_chardev->device.devt = MKDEV(MAJOR(dev), egm_chardev->egmpxm);
+	egm_chardev->device.class = class;
+	egm_chardev->device.release = egm_chardev_release;
+	cdev_init(&egm_chardev->cdev, &file_ops);
+	egm_chardev->cdev.owner = THIS_MODULE;
+
+	ret = dev_set_name(&egm_chardev->device, "egm%llu", egm_chardev->egmpxm);
+	if (ret)
+		goto error_exit;
+
+	ret = cdev_device_add(&egm_chardev->cdev, &egm_chardev->device);
+	if (ret)
+		goto error_exit;
+
+	return egm_chardev;
+
+error_exit:
+	put_device(&egm_chardev->device);
+create_err:
+	return NULL;
+}
+
+static void del_egm_chardev(struct nvgrace_egm_dev *egm_chardev)
+{
+	cdev_device_del(&egm_chardev->cdev, &egm_chardev->device);
+	put_device(&egm_chardev->device);
+}
 
 static char *egm_devnode(const struct device *device, umode_t *mode)
 {
@@ -89,13 +165,10 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 		if (!egm_entry)
 			return -ENOMEM;
 
-		egm_dev = kzalloc(sizeof(*egm_dev), GFP_KERNEL);
-		if (!egm_dev) {
-			kfree(egm_entry);
-			return -ENOMEM;
-		}
+		egm_dev = setup_egm_chardev(egmpxm);
+		if (!egm_dev)
+			return -EINVAL;
 
-		egm_dev->egmpxm = egmpxm;
 		egm_entry->egm_dev = egm_dev;
 
 		list_add_tail(&egm_entry->list, &egm_chardevs);
@@ -110,7 +183,7 @@ static void nvgrace_egm_destroy_pci_devs(void)
 
 	list_for_each_entry_safe(entry, tmp, &egm_chardevs, list) {
 		list_del(&entry->list);
-		kfree(entry);
+		del_egm_chardev(entry->egm_dev);
 	}
 }
 
