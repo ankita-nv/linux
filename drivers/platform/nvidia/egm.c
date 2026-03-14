@@ -11,10 +11,16 @@
 static dev_t dev;
 static struct class *class;
 
+struct gpu_node {
+	struct list_head list;
+	struct pci_dev *pdev;
+};
+
 struct nvgrace_egm_dev {
 	struct device device;
 	struct cdev cdev;
 	u64 egmpxm;
+	struct list_head gpus;
 };
 
 struct nvgrace_egm_dev_entry {
@@ -51,10 +57,36 @@ static const struct file_operations file_ops = {
 	.mmap = nvgrace_egm_mmap,
 };
 
+static int add_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
+{
+	struct gpu_node *node;
+
+	node = kzalloc_obj(*node, GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+
+	node->pdev = pdev;
+
+	list_add_tail(&node->list, &egm_dev->gpus);
+
+	return 0;
+}
+
+static void remove_gpus(struct nvgrace_egm_dev *egm_dev)
+{
+	struct gpu_node *node, *tmp;
+
+	list_for_each_entry_safe(node, tmp, &egm_dev->gpus, list) {
+		list_del(&node->list);
+		kfree(node);
+	}
+}
+
 static void egm_chardev_release(struct device *dev)
 {
 	struct nvgrace_egm_dev *egm_chardev = container_of(dev, struct nvgrace_egm_dev, device);
 
+	remove_gpus(egm_chardev);
 	kfree(egm_chardev);
 }
 
@@ -75,6 +107,8 @@ static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmpxm)
 	 * /dev/egmX.
 	 */
 	egm_chardev->egmpxm = egmpxm;
+	INIT_LIST_HEAD(&egm_chardev->gpus);
+
 	egm_chardev->device.devt = MKDEV(MAJOR(dev), egm_chardev->egmpxm);
 	egm_chardev->device.class = class;
 	egm_chardev->device.release = egm_chardev_release;
@@ -140,6 +174,17 @@ static bool is_duplicate_egm_entry(u64 egmpxm)
 	return false;
 }
 
+static void nvgrace_egm_destroy_pci_devs(void)
+{
+	struct nvgrace_egm_dev_entry *entry, *tmp;
+
+	list_for_each_entry_safe(entry, tmp, &egm_chardevs, list) {
+		list_del(&entry->list);
+		del_egm_chardev(entry->egm_dev);
+		kfree(entry);
+	}
+}
+
 /*
  * Walk all PCI devices and, for each one that has a companion ACPI object
  * advertising EGM properties, create an auxiliary device for that EGM range.
@@ -151,6 +196,7 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 	struct nvgrace_egm_dev_entry *egm_entry;
 	struct nvgrace_egm_dev *egm_dev;
 	struct pci_dev *pdev = NULL;
+	int ret;
 
 	for_each_pci_dev(pdev) {
 		u64 egmpxm;
@@ -173,21 +219,21 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 
 		egm_entry->egm_dev = egm_dev;
 
+		ret = add_gpu(egm_entry->egm_dev, pdev);
+		if (ret) {
+			del_egm_chardev(egm_dev);
+			kfree(egm_entry);
+			goto free_dev;
+		}
+
 		list_add_tail(&egm_entry->list, &egm_chardevs);
 	}
 
 	return 0;
-}
 
-static void nvgrace_egm_destroy_pci_devs(void)
-{
-	struct nvgrace_egm_dev_entry *entry, *tmp;
-
-	list_for_each_entry_safe(entry, tmp, &egm_chardevs, list) {
-		list_del(&entry->list);
-		del_egm_chardev(entry->egm_dev);
-		kfree(entry);
-	}
+free_dev:
+	nvgrace_egm_destroy_pci_devs();
+	return ret;
 }
 
 static int __init nvgrace_egm_init(void)
