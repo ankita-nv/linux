@@ -213,6 +213,27 @@ static const struct file_operations file_ops = {
 	.unlocked_ioctl = nvgrace_egm_ioctl,
 };
 
+static int nvgrace_egm_create_gpu_links(struct nvgrace_egm_dev *egm_dev,
+					struct pci_dev *pdev)
+{
+	int ret;
+
+	ret = sysfs_create_link(&egm_dev->device.kobj,
+				&pdev->dev.kobj,
+				dev_name(&pdev->dev));
+
+	if (ret && ret != -EEXIST)
+		return ret;
+
+	return 0;
+}
+
+static void remove_egm_symlinks(struct nvgrace_egm_dev *egm_dev,
+				struct pci_dev *pdev)
+{
+	sysfs_remove_link(&egm_dev->device.kobj, dev_name(&pdev->dev));
+}
+
 static int add_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
 {
 	struct gpu_node *node;
@@ -225,7 +246,7 @@ static int add_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
 
 	list_add_tail(&node->list, &egm_dev->gpus);
 
-	return 0;
+	return nvgrace_egm_create_gpu_links(egm_dev, pdev);
 }
 
 static void remove_gpus(struct nvgrace_egm_dev *egm_dev)
@@ -233,6 +254,7 @@ static void remove_gpus(struct nvgrace_egm_dev *egm_dev)
 	struct gpu_node *node, *tmp;
 
 	list_for_each_entry_safe(node, tmp, &egm_dev->gpus, list) {
+		remove_egm_symlinks(egm_dev, node->pdev);
 		list_del(&node->list);
 		kfree(node);
 	}
