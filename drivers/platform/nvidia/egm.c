@@ -19,6 +19,8 @@ struct gpu_node {
 struct nvgrace_egm_dev {
 	struct device device;
 	struct cdev cdev;
+	phys_addr_t egmphys;
+	size_t egmlength;
 	u64 egmpxm;
 	struct list_head gpus;
 };
@@ -90,7 +92,8 @@ static void egm_chardev_release(struct device *dev)
 	kfree(egm_chardev);
 }
 
-static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmpxm)
+static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
+						  u64 egmpxm)
 {
 	struct nvgrace_egm_dev *egm_chardev;
 	int ret;
@@ -106,6 +109,8 @@ static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmpxm)
 	 * number. So the EGM corresponding to node X would be
 	 * /dev/egmX.
 	 */
+	egm_chardev->egmphys = egmphys;
+	egm_chardev->egmlength = egmlength;
 	egm_chardev->egmpxm = egmpxm;
 	INIT_LIST_HEAD(&egm_chardev->gpus);
 
@@ -156,6 +161,26 @@ static int has_egm_property(struct pci_dev *pdev, u64 *pegmpxm)
 					pegmpxm);
 }
 
+static int fetch_egm_property(struct pci_dev *pdev, u64 *pegmphys,
+			      u64 *pegmlength)
+{
+	int ret;
+
+	/*
+	 * The memory information is present in the system ACPI tables as DSD
+	 * properties nvidia,egm-base-pa and nvidia,egm-size.
+	 */
+	ret = device_property_read_u64(&pdev->dev, "nvidia,egm-size",
+				       pegmlength);
+	if (ret)
+		return ret;
+
+	ret = device_property_read_u64(&pdev->dev, "nvidia,egm-base-pa",
+				       pegmphys);
+
+	return ret;
+}
+
 static bool is_duplicate_egm_entry(u64 egmpxm)
 {
 	struct nvgrace_egm_dev_entry *egm_entry;
@@ -199,9 +224,13 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 	int ret;
 
 	for_each_pci_dev(pdev) {
-		u64 egmpxm;
+		u64 egmphys, egmlength, egmpxm;
 
 		if (has_egm_property(pdev, &egmpxm))
+			continue;
+
+		ret = fetch_egm_property(pdev, &egmphys, &egmlength);
+		if (ret)
 			continue;
 
 		if (is_duplicate_egm_entry(egmpxm))
@@ -211,7 +240,7 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 		if (!egm_entry)
 			return -ENOMEM;
 
-		egm_dev = setup_egm_chardev(egmpxm);
+		egm_dev = setup_egm_chardev(egmphys, egmlength, egmpxm);
 		if (!egm_dev) {
 			kfree(egm_entry);
 			return -EINVAL;
