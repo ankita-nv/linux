@@ -3,6 +3,7 @@
  * Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved
  */
 
+#include <linux/sizes.h>
 #include <linux/vfio_pci_core.h>
 
 #define NVGRACE_EGM_DEV_NAME "egm"
@@ -20,6 +21,7 @@ struct gpu_node {
 struct nvgrace_egm_dev {
 	struct device device;
 	struct cdev cdev;
+	atomic_t open_count;
 	phys_addr_t egmphys;
 	size_t egmlength;
 	u64 egmpxm;
@@ -42,15 +44,48 @@ static int nvgrace_egm_open(struct inode *inode, struct file *file)
 {
 	struct nvgrace_egm_dev *egm_dev =
 		container_of(inode->i_cdev, struct nvgrace_egm_dev, cdev);
+	void *memaddr;
+	size_t remaining, chunk_size;
+	u8 *chunk_addr;
 
 	file->private_data = egm_dev;
 
+	if (atomic_inc_return(&egm_dev->open_count) > 1)
+		return 0;
+
+	/*
+	 * nvgrace-egm module is responsible to manage the EGM memory as
+	 * the host kernel has no knowledge of it. Clear the region before
+	 * handing over to userspace.
+	 */
+	memaddr = memremap(egm_dev->egmphys, egm_dev->egmlength, MEMREMAP_WB);
+	if (!memaddr) {
+		atomic_dec(&egm_dev->open_count);
+		return -ENOMEM;
+	}
+
+	remaining = egm_dev->egmlength;
+	chunk_addr = memaddr;
+
+	while (remaining > 0) {
+		chunk_size = min(remaining, SZ_1G);
+		memset(chunk_addr, 0, chunk_size);
+		cond_resched();
+		chunk_addr += chunk_size;
+		remaining -= chunk_size;
+	}
+
+	memunmap(memaddr);
 	return 0;
 }
 
 static int nvgrace_egm_release(struct inode *inode, struct file *file)
 {
-	file->private_data = NULL;
+	struct nvgrace_egm_dev *egm_dev =
+		container_of(inode->i_cdev, struct nvgrace_egm_dev, cdev);
+
+	if (atomic_dec_and_test(&egm_dev->open_count))
+		file->private_data = NULL;
 
 	return 0;
 }
@@ -141,6 +176,7 @@ static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
 	egm_chardev->egmphys = egmphys;
 	egm_chardev->egmlength = egmlength;
 	egm_chardev->egmpxm = egmpxm;
+	atomic_set(&egm_chardev->open_count, 0);
 	INIT_LIST_HEAD(&egm_chardev->gpus);
 
 	egm_chardev->device.devt = MKDEV(MAJOR(dev), egm_chardev->egmpxm);
