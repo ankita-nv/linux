@@ -6,6 +6,7 @@
 #include <linux/hashtable.h>
 #include <linux/sizes.h>
 #include <linux/vfio_pci_core.h>
+#include <uapi/linux/egm.h>
 
 #define NVGRACE_EGM_DEV_NAME "egm"
 #define MAX_EGM_NODES 4
@@ -124,11 +125,78 @@ static int nvgrace_egm_mmap(struct file *file, struct vm_area_struct *vma)
 			       vma->vm_page_prot);
 }
 
+static long nvgrace_egm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	unsigned long minsz = offsetofend(struct egm_retired_pages_list, count);
+	struct egm_retired_pages_list info;
+	void __user *uarg = (void __user *)arg;
+	struct nvgrace_egm_dev *egm_dev = file->private_data;
+
+	if (copy_from_user(&info, uarg, minsz))
+		return -EFAULT;
+
+	if (info.argsz < minsz || !egm_dev)
+		return -EINVAL;
+
+	switch (cmd) {
+	case EGM_RETIRED_PAGES_LIST: {
+		unsigned long retired_page_struct_size = sizeof(struct egm_retired_pages_info);
+		struct egm_retired_pages_info tmp;
+		struct h_node *cur_page;
+		struct hlist_node *tmp_node;
+		unsigned long bkt;
+		int count = 0, index = 0;
+		int ret;
+
+		hash_for_each_safe(egm_dev->htbl, bkt, tmp_node, cur_page, node)
+			count++;
+
+		if (info.argsz < (minsz + count * retired_page_struct_size)) {
+			info.argsz = minsz + count * retired_page_struct_size;
+			info.count = 0;
+			goto done;
+		} else {
+			hash_for_each_safe(egm_dev->htbl, bkt, tmp_node, cur_page, node) {
+				/*
+				 * This check fails if there was an ECC error
+				 * after the usermode app read the count of
+				 * bad pages through this ioctl.
+				 */
+				if (minsz + index * retired_page_struct_size >= info.argsz) {
+					info.argsz = minsz + index * retired_page_struct_size;
+					info.count = index;
+					goto done;
+				}
+
+				tmp.offset = cur_page->mem_offset;
+				tmp.size = PAGE_SIZE;
+
+				ret = copy_to_user(uarg + minsz +
+						   index * retired_page_struct_size,
+						   &tmp, retired_page_struct_size);
+				if (ret)
+					return -EFAULT;
+				index++;
+			}
+
+			info.count = index;
+		}
+		break;
+	}
+	default:
+		return -EINVAL;
+	}
+
+done:
+	return copy_to_user(uarg, &info, minsz) ? -EFAULT : 0;
+}
+
 static const struct file_operations file_ops = {
 	.owner = THIS_MODULE,
 	.open = nvgrace_egm_open,
 	.release = nvgrace_egm_release,
 	.mmap = nvgrace_egm_mmap,
+	.unlocked_ioctl = nvgrace_egm_ioctl,
 };
 
 static int add_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
