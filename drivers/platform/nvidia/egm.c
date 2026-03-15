@@ -3,12 +3,18 @@
  * Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved
  */
 
+#include <linux/hashtable.h>
 #include <linux/sizes.h>
 #include <linux/vfio_pci_core.h>
 
 #define NVGRACE_EGM_DEV_NAME "egm"
 #define MAX_EGM_NODES 4
 #define EGM_OFFSET_SHIFT 40
+
+struct h_node {
+	unsigned long mem_offset;
+	struct hlist_node node;
+};
 
 static dev_t dev;
 static struct class *class;
@@ -22,8 +28,10 @@ struct nvgrace_egm_dev {
 	struct device device;
 	struct cdev cdev;
 	atomic_t open_count;
+	DECLARE_HASHTABLE(htbl, 16);
 	phys_addr_t egmphys;
 	size_t egmlength;
+	phys_addr_t retiredpagesphys;
 	u64 egmpxm;
 	struct list_head gpus;
 };
@@ -157,7 +165,8 @@ static void egm_chardev_release(struct device *dev)
 }
 
 static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
-						  u64 egmpxm)
+						  u64 egmpxm,
+						  u64 retiredpagesphys)
 {
 	struct nvgrace_egm_dev *egm_chardev;
 	int ret;
@@ -176,6 +185,7 @@ static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
 	egm_chardev->egmphys = egmphys;
 	egm_chardev->egmlength = egmlength;
 	egm_chardev->egmpxm = egmpxm;
+	egm_chardev->retiredpagesphys = retiredpagesphys;
 	atomic_set(&egm_chardev->open_count, 0);
 	INIT_LIST_HEAD(&egm_chardev->gpus);
 
@@ -207,6 +217,64 @@ static void del_egm_chardev(struct nvgrace_egm_dev *egm_chardev)
 	put_device(&egm_chardev->device);
 }
 
+static void cleanup_retired_pages(struct nvgrace_egm_dev *egm_dev)
+{
+	struct h_node *cur_page;
+	unsigned long bkt;
+	struct hlist_node *temp_node;
+
+	hash_for_each_safe(egm_dev->htbl, bkt, temp_node, cur_page, node) {
+		hash_del(&cur_page->node);
+		kvfree(cur_page);
+	}
+}
+
+static int nvgrace_egm_fetch_retired_pages(struct nvgrace_egm_dev *egm_dev)
+{
+	u64 count;
+	void *memaddr;
+	int index, ret = 0;
+
+	memaddr = memremap(egm_dev->retiredpagesphys, PAGE_SIZE, MEMREMAP_WB);
+	if (!memaddr)
+		return -ENOMEM;
+
+	count = *(u64 *)memaddr;
+	if (count > (PAGE_SIZE - sizeof(u64)) / sizeof(u64)) {
+		memunmap(memaddr);
+		return -EINVAL;
+	}
+
+	for (index = 0; index < count; index++) {
+		struct h_node *retired_page;
+
+		/*
+		 * Since the EGM is linearly mapped, the offset in the
+		 * carveout is the same offset in the VM system memory.
+		 *
+		 * Calculate the offset to communicate to the usermode
+		 * apps.
+		 */
+		retired_page = kvzalloc(sizeof(*retired_page), GFP_KERNEL);
+		if (!retired_page) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		retired_page->mem_offset = *((u64 *)memaddr + index + 1) -
+					   egm_dev->egmphys;
+		hash_add(egm_dev->htbl, &retired_page->node,
+			 retired_page->mem_offset);
+	}
+
+	memunmap(memaddr);
+
+	if (ret)
+		cleanup_retired_pages(egm_dev);
+
+	return ret;
+}
+
 static char *egm_devnode(const struct device *device, umode_t *mode)
 {
 	if (mode)
@@ -227,22 +295,41 @@ static int has_egm_property(struct pci_dev *pdev, u64 *pegmpxm)
 }
 
 static int fetch_egm_property(struct pci_dev *pdev, u64 *pegmphys,
-			      u64 *pegmlength)
+			      u64 *pegmlength, u64 *pretiredpagesphys)
 {
 	int ret;
 
 	/*
-	 * The memory information is present in the system ACPI tables as DSD
-	 * properties nvidia,egm-base-pa and nvidia,egm-size.
+	 * The EGM memory information is present in the system ACPI tables
+	 * as DSD properties nvidia,egm-base-pa and nvidia,egm-size.
 	 */
 	ret = device_property_read_u64(&pdev->dev, "nvidia,egm-size",
 				       pegmlength);
 	if (ret)
-		return ret;
+		goto error_exit;
 
 	ret = device_property_read_u64(&pdev->dev, "nvidia,egm-base-pa",
 				       pegmphys);
+	if (ret)
+		goto error_exit;
 
+	/*
+	 * SBIOS puts the list of retired pages on a region. The region
+	 * SPA is exposed as "nvidia,egm-retired-pages-data-base".
+	 */
+	ret = device_property_read_u64(&pdev->dev,
+				       "nvidia,egm-retired-pages-data-base",
+				       pretiredpagesphys);
+	if (ret)
+		goto error_exit;
+
+	/* Catch firmware bug and avoid a crash */
+	if (*pretiredpagesphys == 0) {
+		dev_err(&pdev->dev, "Retired pages region is not setup\n");
+		ret = -EINVAL;
+	}
+
+error_exit:
 	return ret;
 }
 
@@ -270,6 +357,7 @@ static void nvgrace_egm_destroy_pci_devs(void)
 
 	list_for_each_entry_safe(entry, tmp, &egm_chardevs, list) {
 		list_del(&entry->list);
+		cleanup_retired_pages(entry->egm_dev);
 		del_egm_chardev(entry->egm_dev);
 		kfree(entry);
 	}
@@ -289,12 +377,13 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 	int ret;
 
 	for_each_pci_dev(pdev) {
-		u64 egmphys, egmlength, egmpxm;
+		u64 egmphys, egmlength, egmpxm, retiredpagesphys;
 
 		if (has_egm_property(pdev, &egmpxm))
 			continue;
 
-		ret = fetch_egm_property(pdev, &egmphys, &egmlength);
+		ret = fetch_egm_property(pdev, &egmphys, &egmlength,
+					 &retiredpagesphys);
 		if (ret)
 			continue;
 
@@ -305,10 +394,20 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 		if (!egm_entry)
 			return -ENOMEM;
 
-		egm_dev = setup_egm_chardev(egmphys, egmlength, egmpxm);
+		egm_dev = setup_egm_chardev(egmphys, egmlength, egmpxm,
+					    retiredpagesphys);
 		if (!egm_dev) {
 			kfree(egm_entry);
 			return -EINVAL;
+		}
+
+		hash_init(egm_dev->htbl);
+
+		ret = nvgrace_egm_fetch_retired_pages(egm_dev);
+		if (ret) {
+			del_egm_chardev(egm_dev);
+			kfree(egm_entry);
+			return ret;
 		}
 
 		egm_entry->egm_dev = egm_dev;
