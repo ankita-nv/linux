@@ -7,6 +7,7 @@
 
 #define NVGRACE_EGM_DEV_NAME "egm"
 #define MAX_EGM_NODES 4
+#define EGM_OFFSET_SHIFT 40
 
 static dev_t dev;
 static struct class *class;
@@ -39,17 +40,45 @@ static LIST_HEAD(egm_chardevs);
 
 static int nvgrace_egm_open(struct inode *inode, struct file *file)
 {
+	struct nvgrace_egm_dev *egm_dev =
+		container_of(inode->i_cdev, struct nvgrace_egm_dev, cdev);
+
+	file->private_data = egm_dev;
+
 	return 0;
 }
 
 static int nvgrace_egm_release(struct inode *inode, struct file *file)
 {
+	file->private_data = NULL;
+
 	return 0;
 }
 
 static int nvgrace_egm_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	return 0;
+	struct nvgrace_egm_dev *egm_dev = file->private_data;
+	u64 req_len, pgoff, end;
+	unsigned long start_pfn;
+
+	pgoff = vma->vm_pgoff &
+		((1U << (EGM_OFFSET_SHIFT - PAGE_SHIFT)) - 1);
+
+	if (check_sub_overflow(vma->vm_end, vma->vm_start, &req_len) ||
+	    check_add_overflow(PHYS_PFN(egm_dev->egmphys), pgoff, &start_pfn) ||
+	    check_add_overflow(PFN_PHYS(pgoff), req_len, &end))
+		return -EOVERFLOW;
+
+	if (end > egm_dev->egmlength)
+		return -EINVAL;
+
+	/*
+	 * EGM memory is invisible to the host kernel and is not managed
+	 * by it. Map the usermode VMA to the EGM region.
+	 */
+	return remap_pfn_range(vma, vma->vm_start,
+			       start_pfn, req_len,
+			       vma->vm_page_prot);
 }
 
 static const struct file_operations file_ops = {
