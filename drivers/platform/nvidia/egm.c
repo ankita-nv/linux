@@ -351,6 +351,31 @@ static char *egm_devnode(const struct device *device, umode_t *mode)
 	return NULL;
 }
 
+static ssize_t egm_size_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct nvgrace_egm_dev *egm_dev =
+		container_of(dev, struct nvgrace_egm_dev, device);
+
+	return sysfs_emit(buf, "0x%lx\n", egm_dev->egmlength);
+}
+
+static DEVICE_ATTR_RO(egm_size);
+
+static struct attribute *attrs[] = {
+	&dev_attr_egm_size.attr,
+	NULL,
+};
+
+static const struct attribute_group attr_group = {
+	.attrs = attrs,
+};
+
+static const struct attribute_group *attr_groups[] = {
+	&attr_group,
+	NULL
+};
+
 /*
  * Determine if the EGM feature is enabled. If disabled, there
  * will be no EGM properties populated in the ACPI tables and this
@@ -518,6 +543,7 @@ static int __init nvgrace_egm_init(void)
 	}
 
 	class->devnode = egm_devnode;
+	class->dev_groups = attr_groups;
 
 	ret = nvgrace_egm_create_pci_egm_devs();
 	if (ret)
