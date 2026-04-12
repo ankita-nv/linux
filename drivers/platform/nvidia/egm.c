@@ -7,9 +7,23 @@
 #include <linux/sched/signal.h>
 #include <linux/sizes.h>
 #include <linux/vfio_pci_core.h>
+#include <linux/xarray.h>
+#include <uapi/linux/egm.h>
 
 #define NVGRACE_EGM_DEV_NAME "egm"
 #define MAX_EGM_NODES 4
+
+/*
+ * Presence marker stored in nvgrace_egm_dev::retired_pages. Only the index
+ * (page offset within the region) carries information; the value just needs
+ * to be a non-NULL xa entry.
+ */
+#define EGM_RETIRED_MARK xa_mk_value(1)
+
+struct th500_egm_retired_pages {
+	u64 num_retired_pages;
+	__u64 retired_page_addr[4096];
+};
 
 static dev_t dev;
 static struct class *class;
@@ -24,8 +38,17 @@ struct nvgrace_egm_dev {
 	struct cdev cdev;
 	struct mutex open_lock; /* serialises the first-open scrub */
 	unsigned int open_count; /* protected by open_lock */
+	/*
+	 * Set of retired-page offsets within the EGM region, keyed by page
+	 * index (offset >> PAGE_SHIFT). Populated from SBIOS at setup and
+	 * extended at runtime from the memory_failure callback. The xarray
+	 * has its own lock and grows on demand, so a sparsely retired region
+	 * costs almost nothing.
+	 */
+	struct xarray retired_pages;
 	phys_addr_t egmphys;
 	size_t egmlength;
+	phys_addr_t retiredpagesphys;
 	u64 egmpxm;
 	struct list_head gpus;
 };
@@ -41,6 +64,9 @@ struct nvgrace_egm_dev_entry {
  * the EGM device for that socket.
  */
 static LIST_HEAD(egm_chardevs);
+
+static void cleanup_retired_pages(struct nvgrace_egm_dev *egm_dev);
+static int nvgrace_egm_fetch_retired_pages(struct nvgrace_egm_dev *egm_dev);
 
 static int nvgrace_egm_open(struct inode *inode, struct file *file)
 {
@@ -175,11 +201,75 @@ static int nvgrace_egm_mmap(struct file *file, struct vm_area_struct *vma)
 			       vma->vm_page_prot);
 }
 
+static long nvgrace_egm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	unsigned long minsz = offsetofend(struct egm_retired_pages_list, count);
+	struct egm_retired_pages_list info;
+	void __user *uarg = (void __user *)arg;
+	struct nvgrace_egm_dev *egm_dev = file->private_data;
+
+	if (copy_from_user(&info, uarg, minsz))
+		return -EFAULT;
+
+	if (info.argsz < minsz || !egm_dev)
+		return -EINVAL;
+
+	switch (cmd) {
+	case EGM_RETIRED_PAGES_LIST: {
+		unsigned long retired_page_struct_size = sizeof(struct egm_retired_pages_info);
+		struct egm_retired_pages_info tmp;
+		unsigned long page_index;
+		void *entry;
+		int count = 0, fill = 0;
+
+		xa_for_each(&egm_dev->retired_pages, page_index, entry)
+			count++;
+
+		if (info.argsz < (minsz + count * retired_page_struct_size)) {
+			info.argsz = minsz + count * retired_page_struct_size;
+			info.count = 0;
+			goto done;
+		}
+
+		/*
+		 * xa_for_each() holds no lock across the body, so copy_to_user
+		 * is safe inside it.  The table only grows (entries are freed
+		 * only when the device is released, which cannot happen while
+		 * this fd is open), so cap at the count taken above; any entries
+		 * added concurrently are reported by a subsequent ioctl call.
+		 */
+		xa_for_each(&egm_dev->retired_pages, page_index, entry) {
+			if (fill >= count)
+				break;
+
+			tmp.offset = (u64)page_index << PAGE_SHIFT;
+			tmp.size = PAGE_SIZE;
+
+			if (copy_to_user((u8 __user *)uarg + minsz +
+					 fill * retired_page_struct_size,
+					 &tmp, retired_page_struct_size))
+				return -EFAULT;
+
+			fill++;
+		}
+
+		info.count = fill;
+		break;
+	}
+	default:
+		return -EINVAL;
+	}
+
+done:
+	return copy_to_user(uarg, &info, minsz) ? -EFAULT : 0;
+}
+
 static const struct file_operations file_ops = {
 	.owner = THIS_MODULE,
 	.open = nvgrace_egm_open,
 	.release = nvgrace_egm_release,
 	.mmap = nvgrace_egm_mmap,
+	.unlocked_ioctl = nvgrace_egm_ioctl,
 };
 
 static int nvgrace_egm_create_gpu_links(struct nvgrace_egm_dev *egm_dev,
@@ -240,13 +330,15 @@ static void egm_chardev_release(struct device *dev)
 {
 	struct nvgrace_egm_dev *egm_chardev = container_of(dev, struct nvgrace_egm_dev, device);
 
+	cleanup_retired_pages(egm_chardev);
 	remove_gpus(egm_chardev);
 	mutex_destroy(&egm_chardev->open_lock);
 	kfree(egm_chardev);
 }
 
 static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
-						 u64 egmpxm)
+						 u64 egmpxm,
+						 u64 retiredpagesphys)
 {
 	struct nvgrace_egm_dev *egm_chardev;
 	unsigned int baseminor = MINOR(dev);
@@ -276,7 +368,9 @@ static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
 	egm_chardev->egmphys = egmphys;
 	egm_chardev->egmlength = egmlength;
 	egm_chardev->egmpxm = egmpxm;
+	egm_chardev->retiredpagesphys = retiredpagesphys;
 	mutex_init(&egm_chardev->open_lock);
+	xa_init(&egm_chardev->retired_pages);
 	INIT_LIST_HEAD(&egm_chardev->gpus);
 
 	egm_chardev->device.devt = MKDEV(MAJOR(dev), egm_chardev->egmpxm);
@@ -286,6 +380,15 @@ static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
 	egm_chardev->cdev.owner = THIS_MODULE;
 
 	ret = dev_set_name(&egm_chardev->device, "egm%llu", egm_chardev->egmpxm);
+	if (ret)
+		goto error_exit;
+
+	/*
+	 * Populate the retired-pages table before publishing the device with
+	 * cdev_device_add() so that a racing open()+EGM_RETIRED_PAGES_LIST
+	 * cannot observe an empty table and report zero retired pages.
+	 */
+	ret = nvgrace_egm_fetch_retired_pages(egm_chardev);
 	if (ret)
 		goto error_exit;
 
@@ -305,6 +408,92 @@ static void del_egm_chardev(struct nvgrace_egm_dev *egm_chardev)
 {
 	cdev_device_del(&egm_chardev->cdev, &egm_chardev->device);
 	put_device(&egm_chardev->device);
+}
+
+static void cleanup_retired_pages(struct nvgrace_egm_dev *egm_dev)
+{
+	/* Entries are value marks, so xa_destroy() frees the table itself. */
+	xa_destroy(&egm_dev->retired_pages);
+}
+
+static int nvgrace_egm_fetch_retired_pages(struct nvgrace_egm_dev *egm_dev)
+{
+	struct th500_egm_retired_pages *egm_retired;
+	u64 count;
+	int index, ret = 0;
+
+	/* No retired-pages region was advertised; nothing to populate. */
+	if (!egm_dev->retiredpagesphys)
+		return 0;
+
+	/*
+	 * Map the full th500_egm_retired_pages structure so that the
+	 * mapping covers all 4096 address slots regardless of whether
+	 * the kernel is using 4K or 64K pages.
+	 */
+	egm_retired = memremap(egm_dev->retiredpagesphys,
+			       sizeof(*egm_retired), MEMREMAP_WB);
+	if (!egm_retired)
+		return -ENOMEM;
+
+	count = egm_retired->num_retired_pages;
+	if (count > ARRAY_SIZE(egm_retired->retired_page_addr)) {
+		memunmap(egm_retired);
+		return -EINVAL;
+	}
+
+	for (index = 0; index < count && !ret; index++) {
+		phys_addr_t base = egm_retired->retired_page_addr[index];
+		int sub;
+
+		/*
+		 * Entries come from SBIOS. Skip any base outside the EGM
+		 * region [egmphys, egmphys + egmlength); otherwise a bogus
+		 * base would be turned into an out-of-range offset and
+		 * reported to userspace.
+		 */
+		if (base < egm_dev->egmphys ||
+		    base >= egm_dev->egmphys + egm_dev->egmlength) {
+			dev_warn_ratelimited(&egm_dev->device,
+					     "Ignoring retired page %pa outside EGM region\n",
+					     &base);
+			continue;
+		}
+
+		/*
+		 * Since the EGM is linearly mapped, the offset in the
+		 * carveout is the same offset in the VM system memory.
+		 *
+		 * Calculate the offset to communicate to the usermode
+		 * apps.
+		 *
+		 * The retired page entry represent a retired region of
+		 * size 64K. So on a 4K kernel, each entry spans 0x10
+		 * 4K sub-pages; add one entry per sub-page so that any
+		 * lookup at 4K granularity hits the right retired range.
+		 */
+		for (sub = 0; sub < SZ_64K / PAGE_SIZE; sub++) {
+			unsigned long offset = base +
+				(phys_addr_t)sub * PAGE_SIZE - egm_dev->egmphys;
+			void *old;
+
+			old = xa_store(&egm_dev->retired_pages,
+				       offset >> PAGE_SHIFT, EGM_RETIRED_MARK,
+				       GFP_KERNEL);
+			if (xa_is_err(old)) {
+				ret = xa_err(old);
+				break;
+			}
+		}
+	}
+
+	memunmap(egm_retired);
+
+	/*
+	 * On failure the partially populated table is freed by
+	 * egm_chardev_release() via the caller's error path.
+	 */
+	return ret;
 }
 
 static char *egm_devnode(const struct device *device, umode_t *mode)
@@ -352,22 +541,40 @@ static int has_egm_property(struct pci_dev *pdev, u64 *pegmpxm)
 }
 
 static int fetch_egm_property(struct pci_dev *pdev, u64 *pegmphys,
-			      u64 *pegmlength)
+			      u64 *pegmlength, u64 *pretiredpagesphys)
 {
 	int ret;
 
 	/*
-	 * The memory information is present in the system ACPI tables as DSD
-	 * properties nvidia,egm-base-pa and nvidia,egm-size.
+	 * The EGM memory information is present in the system ACPI tables
+	 * as DSD properties nvidia,egm-base-pa and nvidia,egm-size.
 	 */
 	ret = device_property_read_u64(&pdev->dev, "nvidia,egm-size",
 				       pegmlength);
 	if (ret)
-		return ret;
+		goto error_exit;
 
 	ret = device_property_read_u64(&pdev->dev, "nvidia,egm-base-pa",
 				       pegmphys);
+	if (ret)
+		goto error_exit;
 
+	/*
+	 * SBIOS puts the list of retired pages on a region exposed as
+	 * "nvidia,egm-retired-pages-data-base". Older firmware may not expose
+	 * it; treat an absent or zero property as "no retired pages" so the
+	 * EGM device is still created (with an empty retired-pages table)
+	 * rather than disappearing on such platforms.
+	 */
+	ret = device_property_read_u64(&pdev->dev,
+				       "nvidia,egm-retired-pages-data-base",
+				       pretiredpagesphys);
+	if (ret) {
+		*pretiredpagesphys = 0;
+		ret = 0;
+	}
+
+error_exit:
 	return ret;
 }
 
@@ -414,12 +621,13 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 	int ret;
 
 	for_each_pci_dev(pdev) {
-		u64 egmphys, egmlength, egmpxm;
+		u64 egmphys, egmlength, egmpxm, retiredpagesphys;
 
 		if (has_egm_property(pdev, &egmpxm))
 			continue;
 
-		ret = fetch_egm_property(pdev, &egmphys, &egmlength);
+		ret = fetch_egm_property(pdev, &egmphys, &egmlength,
+					 &retiredpagesphys);
 		if (ret)
 			continue;
 
@@ -437,7 +645,8 @@ static int nvgrace_egm_create_pci_egm_devs(void)
 			return -ENOMEM;
 		}
 
-		egm_dev = setup_egm_chardev(egmphys, egmlength, egmpxm);
+		egm_dev = setup_egm_chardev(egmphys, egmlength, egmpxm,
+					    retiredpagesphys);
 		if (!egm_dev) {
 			kfree(egm_entry);
 			pci_dev_put(pdev);
@@ -483,12 +692,13 @@ static int nvgrace_egm_lowest_pxm(u64 *pmin_pxm)
 	bool found = false;
 
 	for_each_pci_dev(pdev) {
-		u64 egmphys, egmlength, egmpxm;
+		u64 egmphys, egmlength, egmpxm, retiredpagesphys;
 
 		if (has_egm_property(pdev, &egmpxm))
 			continue;
 
-		if (fetch_egm_property(pdev, &egmphys, &egmlength))
+		if (fetch_egm_property(pdev, &egmphys, &egmlength,
+				       &retiredpagesphys))
 			continue;
 
 		if (!found || egmpxm < *pmin_pxm) {
