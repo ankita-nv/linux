@@ -4,6 +4,7 @@
  */
 
 #include <linux/hashtable.h>
+#include <linux/memory-failure.h>
 #include <linux/mutex.h>
 #include <linux/sched/signal.h>
 #include <linux/sizes.h>
@@ -34,10 +35,11 @@ struct gpu_node {
 struct nvgrace_egm_dev {
 	struct device device;
 	struct cdev cdev;
-	struct mutex open_lock; /* serialises the first-open scrub */
+	struct mutex open_lock; /* serialises the first-open scrub + PFN registration */
 	unsigned int open_count; /* protected by open_lock */
 	spinlock_t htbl_lock; /* protects htbl */
 	DECLARE_HASHTABLE(htbl, 16);
+	struct pfn_address_space pfn_address_space;
 	phys_addr_t egmphys;
 	size_t egmlength;
 	phys_addr_t retiredpagesphys;
@@ -60,6 +62,109 @@ static LIST_HEAD(egm_chardevs);
 static void cleanup_retired_pages(struct nvgrace_egm_dev *egm_dev);
 static int nvgrace_egm_fetch_retired_pages(struct nvgrace_egm_dev *egm_dev);
 
+static int pfn_memregion_offset(struct nvgrace_egm_dev *egm_dev,
+				unsigned long pfn,
+				pgoff_t *pfn_offset_in_region)
+{
+	unsigned long start_pfn, num_pages;
+
+	start_pfn = PHYS_PFN(egm_dev->egmphys);
+	num_pages = egm_dev->egmlength >> PAGE_SHIFT;
+
+	if (pfn < start_pfn || pfn >= start_pfn + num_pages)
+		return -EFAULT;
+
+	*pfn_offset_in_region = pfn - start_pfn;
+
+	return 0;
+}
+
+static int track_ecc_offset(struct nvgrace_egm_dev *egm_dev,
+			    unsigned long mem_offset)
+{
+	struct h_node *cur_page, *ecc_page;
+
+	/*
+	 * This runs from the pfn_to_vma_pgoff callback, which the
+	 * memory_failure path invokes under rcu_read_lock() (see
+	 * collect_procs_pfn()). Sleeping is not allowed in that atomic
+	 * context, so use GFP_ATOMIC rather than GFP_KERNEL.
+	 */
+	ecc_page = kzalloc_obj(*ecc_page, GFP_ATOMIC);
+	if (!ecc_page)
+		return -ENOMEM;
+
+	ecc_page->mem_offset = mem_offset;
+
+	scoped_guard(spinlock, &egm_dev->htbl_lock) {
+		hash_for_each_possible(egm_dev->htbl, cur_page, node, mem_offset) {
+			if (cur_page->mem_offset == mem_offset) {
+				kfree(ecc_page);
+				return 0;
+			}
+		}
+		hash_add(egm_dev->htbl, &ecc_page->node, ecc_page->mem_offset);
+	}
+
+	return 0;
+}
+
+static int nvgrace_egm_pfn_to_vma_pgoff(struct vm_area_struct *vma,
+					unsigned long pfn,
+					pgoff_t *pgoff)
+{
+	struct nvgrace_egm_dev *egm_dev = vma->vm_file->private_data;
+	pgoff_t vma_offset_in_region = vma->vm_pgoff;
+	pgoff_t pfn_offset_in_region;
+	int ret;
+
+	ret = pfn_memregion_offset(egm_dev, pfn, &pfn_offset_in_region);
+	if (ret)
+		return ret;
+
+	/* Ensure PFN is not before VMA's start within the region */
+	if (pfn_offset_in_region < vma_offset_in_region)
+		return -EFAULT;
+
+	/* Ensure PFN is not past the VMA's end within the region */
+	if (pfn_offset_in_region >= vma_offset_in_region + vma_pages(vma))
+		return -EFAULT;
+
+	/* Calculate offset from VMA start */
+	*pgoff = vma->vm_pgoff +
+		 (pfn_offset_in_region - vma_offset_in_region);
+
+	/*
+	 * Record the poisoned offset for reporting via
+	 * EGM_RETIRED_PAGES_LIST. This bookkeeping is best-effort: its
+	 * failure must not be reported as "vma does not map pfn", or the
+	 * owning process would not be signalled for the poisoned page.
+	 */
+	track_ecc_offset(egm_dev, *pgoff << PAGE_SHIFT);
+
+	return 0;
+}
+
+static int
+nvgrace_egm_vfio_pci_register_pfn_range(struct inode *inode,
+					struct nvgrace_egm_dev *egm_dev)
+{
+	unsigned long pfn, nr_pages;
+	int ret;
+
+	pfn = PHYS_PFN(egm_dev->egmphys);
+	nr_pages = egm_dev->egmlength >> PAGE_SHIFT;
+
+	egm_dev->pfn_address_space.node.start = pfn;
+	egm_dev->pfn_address_space.node.last = pfn + nr_pages - 1;
+	egm_dev->pfn_address_space.mapping = inode->i_mapping;
+	egm_dev->pfn_address_space.pfn_to_vma_pgoff = nvgrace_egm_pfn_to_vma_pgoff;
+
+	ret = register_pfn_address_space(&egm_dev->pfn_address_space);
+
+	return ret;
+}
+
 static int nvgrace_egm_open(struct inode *inode, struct file *file)
 {
 	struct nvgrace_egm_dev *egm_dev =
@@ -72,11 +177,13 @@ static int nvgrace_egm_open(struct inode *inode, struct file *file)
 	file->private_data = egm_dev;
 
 	/*
-	 * Serialise openers so that the first-open scrub completes before any
-	 * opener returns. A counter alone would let a second opener mmap the
-	 * region (and hand it to a VM) while the first opener is still zeroing
-	 * it. The scrub can take minutes on a large region, so take the lock
-	 * killably to keep waiters (other openers, release()) killable.
+	 * Serialise openers so that the first-open scrub and PFN-range
+	 * registration complete before any opener returns. A counter alone
+	 * would let a second opener mmap the region (and hand it to a VM)
+	 * while the first opener is still zeroing it or before the range is
+	 * registered with memory_failure. The scrub can take minutes on a
+	 * large region, so take the lock killably to keep waiters (other
+	 * openers, release()) killable.
 	 */
 	if (mutex_lock_killable(&egm_dev->open_lock))
 		return -EINTR;
@@ -123,10 +230,15 @@ static int nvgrace_egm_open(struct inode *inode, struct file *file)
 		remaining -= chunk_size;
 	}
 
+	ret = nvgrace_egm_vfio_pci_register_pfn_range(inode, egm_dev);
+	if (ret && ret != -EOPNOTSUPP)
+		goto unlock;
+
 	/*
-	 * Mark the device open only after the scrub completes, so a
-	 * concurrent opener cannot observe a non-zero count and proceed
-	 * before the region has been cleared.
+	 * Only mark the device open once the scrub and registration have
+	 * succeeded. On failure open_count stays 0, so this opener returns
+	 * an error (release() never runs for it) and the next opener
+	 * retries the scrub and registration from a clean state.
 	 */
 	egm_dev->open_count = 1;
 	ret = 0;
@@ -143,8 +255,10 @@ static int nvgrace_egm_release(struct inode *inode, struct file *file)
 
 	guard(mutex)(&egm_dev->open_lock);
 
-	if (!--egm_dev->open_count)
+	if (!--egm_dev->open_count) {
+		unregister_pfn_address_space(&egm_dev->pfn_address_space);
 		file->private_data = NULL;
+	}
 
 	return 0;
 }
