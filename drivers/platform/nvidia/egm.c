@@ -3,6 +3,9 @@
  * Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved
  */
 
+#include <linux/mutex.h>
+#include <linux/sched/signal.h>
+#include <linux/sizes.h>
 #include <linux/vfio_pci_core.h>
 
 #define NVGRACE_EGM_DEV_NAME "egm"
@@ -19,6 +22,8 @@ struct gpu_node {
 struct nvgrace_egm_dev {
 	struct device device;
 	struct cdev cdev;
+	struct mutex open_lock; /* serialises the first-open scrub */
+	unsigned int open_count; /* protected by open_lock */
 	phys_addr_t egmphys;
 	size_t egmlength;
 	u64 egmpxm;
@@ -39,22 +44,135 @@ static LIST_HEAD(egm_chardevs);
 
 static int nvgrace_egm_open(struct inode *inode, struct file *file)
 {
-	return 0;
+	struct nvgrace_egm_dev *egm_dev =
+		container_of(inode->i_cdev, struct nvgrace_egm_dev, cdev);
+	phys_addr_t phys;
+	size_t remaining, chunk_size;
+	void *chunk_addr;
+	int ret;
+
+	file->private_data = egm_dev;
+
+	/*
+	 * The EGM region is a physical carveout handed to a single consumer
+	 * (a VM) at a time, and must be scrubbed before each handover. Take
+	 * open_lock killably around the scrub, which can run for minutes on a
+	 * large region, so waiters stay killable.
+	 */
+	if (mutex_lock_killable(&egm_dev->open_lock))
+		return -EINTR;
+
+	/*
+	 * Refuse a second opener while the region is still held. release()
+	 * runs only when the last reference to the struct file drops, but an
+	 * mmap keeps that reference (and hence open_count) alive past
+	 * close(2) for the lifetime of the VMA. So open_count returns to zero
+	 * only once every mapping is gone. A concurrent opener cannot be
+	 * handed the region: it cannot be re-scrubbed without destroying the
+	 * current consumer's live data, and handing it over unscrubbed would
+	 * leak that data to a different consumer.
+	 */
+	if (egm_dev->open_count) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	/*
+	 * nvgrace-egm module is responsible to manage the EGM memory as
+	 * the host kernel has no knowledge of it. Clear the region before
+	 * handing over to userspace.
+	 *
+	 * Map and zero one chunk at a time rather than mapping the whole
+	 * region at once: the EGM region can be very large (hundreds of GiB
+	 * on multi-socket systems) and is not in the kernel linear map, so a
+	 * single memremap() would create one huge ioremap-style mapping.
+	 */
+	phys = egm_dev->egmphys;
+	remaining = egm_dev->egmlength;
+
+	while (remaining > 0) {
+		/* The scrub holds the lock for a long time; let SIGKILL out. */
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			goto unlock;
+		}
+
+		chunk_size = min(remaining, SZ_1G);
+
+		chunk_addr = memremap(phys, chunk_size, MEMREMAP_WB);
+		if (!chunk_addr) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+
+		memset(chunk_addr, 0, chunk_size);
+		memunmap(chunk_addr);
+		cond_resched();
+
+		phys += chunk_size;
+		remaining -= chunk_size;
+	}
+
+	/*
+	 * Mark the device open only after the scrub completes, so a
+	 * concurrent opener cannot observe a non-zero count and proceed
+	 * before the region has been cleared.
+	 */
+	egm_dev->open_count = 1;
+	ret = 0;
+
+unlock:
+	mutex_unlock(&egm_dev->open_lock);
+	return ret;
 }
 
 static int nvgrace_egm_release(struct inode *inode, struct file *file)
 {
+	struct nvgrace_egm_dev *egm_dev =
+		container_of(inode->i_cdev, struct nvgrace_egm_dev, cdev);
+
+	guard(mutex)(&egm_dev->open_lock);
+
+	if (!--egm_dev->open_count)
+		file->private_data = NULL;
+
 	return 0;
 }
 
 static int nvgrace_egm_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	struct nvgrace_egm_dev *egm_dev = file->private_data;
+	u64 req_len, pgoff, end;
+	unsigned long start_pfn, num_pages;
+
+	pgoff = vma->vm_pgoff;
+	num_pages = egm_dev->egmlength >> PAGE_SHIFT;
+
 	/*
-	 * Mapping the EGM region into userspace is implemented by a later
-	 * patch. Until then refuse the mmap rather than installing a VMA with
-	 * no vm_ops and no PTEs, which would oops on the first access.
+	 * Reject a page offset that already lies outside the region before it
+	 * is shifted into a byte count. PFN_PHYS(pgoff) would otherwise
+	 * overflow phys_addr_t for a large vm_pgoff (reachable via mmap()'s
+	 * 64-bit offset) and the wrapped value would slip past the
+	 * "end > egmlength" check below.
 	 */
-	return -EOPNOTSUPP;
+	if (pgoff >= num_pages)
+		return -EINVAL;
+
+	if (check_sub_overflow(vma->vm_end, vma->vm_start, &req_len) ||
+	    check_add_overflow(PHYS_PFN(egm_dev->egmphys), pgoff, &start_pfn) ||
+	    check_add_overflow(PFN_PHYS(pgoff), req_len, &end))
+		return -EOVERFLOW;
+
+	if (end > egm_dev->egmlength)
+		return -EINVAL;
+
+	/*
+	 * EGM memory is invisible to the host kernel and is not managed
+	 * by it. Map the usermode VMA to the EGM region.
+	 */
+	return remap_pfn_range(vma, vma->vm_start,
+			       start_pfn, req_len,
+			       vma->vm_page_prot);
 }
 
 static const struct file_operations file_ops = {
@@ -123,6 +241,7 @@ static void egm_chardev_release(struct device *dev)
 	struct nvgrace_egm_dev *egm_chardev = container_of(dev, struct nvgrace_egm_dev, device);
 
 	remove_gpus(egm_chardev);
+	mutex_destroy(&egm_chardev->open_lock);
 	kfree(egm_chardev);
 }
 
@@ -157,6 +276,7 @@ static struct nvgrace_egm_dev *setup_egm_chardev(u64 egmphys, u64 egmlength,
 	egm_chardev->egmphys = egmphys;
 	egm_chardev->egmlength = egmlength;
 	egm_chardev->egmpxm = egmpxm;
+	mutex_init(&egm_chardev->open_lock);
 	INIT_LIST_HEAD(&egm_chardev->gpus);
 
 	egm_chardev->device.devt = MKDEV(MAJOR(dev), egm_chardev->egmpxm);
