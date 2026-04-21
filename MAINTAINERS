@@ -18921,6 +18921,11 @@ S:	Maintained
 F:	drivers/video/fbdev/nvidia/
 F:	drivers/video/fbdev/riva/
 
+NVIDIA GRACE EGM PLATFORM DRIVER
+M:	Ankit Agrawal <ankita@nvidia.com>
+S:	Supported
+F:	drivers/platform/nvidia/
+
 NVIDIA VRS RTC DRIVER
 M:	Shubhi Garg <shgarg@nvidia.com>
 L:	linux-tegra@vger.kernel.org
