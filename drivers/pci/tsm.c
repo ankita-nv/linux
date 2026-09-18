@@ -1031,7 +1031,14 @@ EXPORT_SYMBOL_GPL(pci_tsm_mmio_teardown);
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_NON_TEE BIT(2)
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_UPDATABLE BIT(3)
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_RANGE_ID GENMASK(31, 16)
-#define PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_COHERENT 0xffff
+
+/*
+ * Only id ~0 (0xffff) is spec-defined (Arm RME DEN0129 section B2.3.5.2);
+ * ~1, ~2, etc. extend it for multi-range reporting: id ~N selects coherent
+ * window N, keeping coherent ids disjoint from BAR ids
+ * (0..PCI_STD_NUM_BARS-1) without a separate flag.
+ */
+#define PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_TO_COH_IDX(id) ((u16)~(id))
 
 /* An interface report 'pfn' is 4K in size */
 struct pci_tsm_devif_mmio {
@@ -1052,37 +1059,39 @@ struct pci_tsm_devif_report {
 
 #ifdef CONFIG_CXL_RESET
 /*
- * pci_tsm_coherent_range() - resolve the device's coherent CXL window
+ * pci_tsm_coherent_range() - resolve the device coherent CXL window
  * @pdev: device owner of the reported ranges
+ * @coh_idx: which coherent range to resolve, per
+ *	     %PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_TO_COH_IDX()
  * @out_base: host physical (guest IPA) base of the coherent window
  * @out_size: size of the coherent window
  *
- * The coherent range carries no BAR number, so its address comes from
- * pdev->coh_resource[], a pre-driver-bind snapshot of committed CXL HDM
- * decoders.
+ * Each @coh_idx names one of the device coherent (CXL) windows. It carries
+ * no BAR number, so its address comes from pdev->coh_resource[@coh_idx],
+ * a pre-driver-bind snapshot of committed CXL HDM decoders.
  *
- * Return: 0 with *@out_base / *@out_size set from the first populated entry,
- * or -ENODEV if no entry is populated.
+ * Return: 0 with *@out_base / *@out_size set, or -ENODEV if @coh_idx is out
+ * of range or has no populated coh_resource[] entry.
  */
-static int pci_tsm_coherent_range(struct pci_dev *pdev, u64 *out_base,
-				  u64 *out_size)
+static int pci_tsm_coherent_range(struct pci_dev *pdev, unsigned int coh_idx,
+				  u64 *out_base, u64 *out_size)
 {
-	for (int i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
-		struct resource *res = &pdev->coh_resource[i];
+	struct resource *res;
 
-		if (!(res->flags & IORESOURCE_MEM))
-			continue;
+	if (coh_idx >= PCI_CXL_MAX_COHERENT_RANGES)
+		return -ENODEV;
 
-		*out_base = res->start;
-		*out_size = resource_size(res);
-		return 0;
-	}
+	res = &pdev->coh_resource[coh_idx];
+	if (!(res->flags & IORESOURCE_MEM))
+		return -ENODEV;
 
-	return -ENODEV;
+	*out_base = res->start;
+	*out_size = resource_size(res);
+	return 0;
 }
 #else
-static int pci_tsm_coherent_range(struct pci_dev *pdev, u64 *out_base,
-				  u64 *out_size)
+static int pci_tsm_coherent_range(struct pci_dev *pdev, unsigned int coh_idx,
+				  u64 *out_base, u64 *out_size)
 {
 	return -ENODEV;
 }
@@ -1107,6 +1116,7 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev,
 	u64 reporting_bar_base, last_reporting_end;
 	u32 mmio_range_count;
 	int last_bar = -1;
+	bool seen_coherent = false;
 	int i;
 
 	if (report_len < sizeof(*devif_report))
@@ -1135,28 +1145,32 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev,
 		u32 attr = __le32_to_cpu(mmio_data->attributes);
 		int bar = FIELD_GET(PCI_TSM_DEVIF_REPORT_MMIO_ATTR_RANGE_ID,
 				    attr);
-		bool coherent =
-			bar == PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_COHERENT;
+		unsigned int coh_idx =
+			PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_TO_COH_IDX(bar);
+		bool coherent = coh_idx < PCI_CXL_MAX_COHERENT_RANGES;
 
 		if (coherent) {
-			if (i != mmio_range_count - 1) {
-				pci_dbg(pdev, "Coherent reporting range is not last\n");
-				return NULL;
-			}
+			seen_coherent = true;
 
 			/*
-			 * No BAR names the coherent range, so fail closed if
-			 * neither a CXL region nor a committed HDM decoder
-			 * resolves its address.
+			 * Fail closed if pdev->coh_resource[coh_idx] isn't
+			 * populated: nothing else in the report identifies
+			 * the window's address.
 			 */
-			if (pci_tsm_coherent_range(pdev, &range_base,
+			if (pci_tsm_coherent_range(pdev, coh_idx, &range_base,
 						   &range_len)) {
-				pci_dbg(pdev, "No CXL region or committed HDM decoder for coherent reporting range\n");
+				pci_dbg(pdev, "No populated coh_resource[] entry for coherent range %u\n",
+					coh_idx);
 				return NULL;
 			}
 
-			/* Coherent range is last and not part of the BAR sequence. */
+			/* Coherent ranges are not part of the BAR sequence. */
 		} else {
+			if (seen_coherent) {
+				pci_dbg(pdev, "BAR reporting range follows a coherent range\n");
+				return NULL;
+			}
+
 			if (bar >= PCI_STD_NUM_BARS ||
 			    !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM) ||
 			    (pci_resource_flags(pdev, bar) & IORESOURCE_UNSET)) {
