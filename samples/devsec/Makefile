@@ -6,5 +6,5 @@ devsec_common-y := common.o
 obj-$(CONFIG_SAMPLE_DEVSEC) += devsec_bus.o
 devsec_bus-y := bus.o
 
-obj-$(CONFIG_SAMPLE_DEVSEC) += devsec_link_tsm.o
-devsec_link_tsm-y := link_tsm.o
+obj-$(CONFIG_SAMPLE_DEVSEC) += devsec_mmio_test.o
+devsec_mmio_test-y := mmio_test.o
