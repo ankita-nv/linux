@@ -404,6 +404,47 @@ static struct cxl_hdm_info *cxl_pci_hdm_read_info(struct pci_dev *pdev,
 	return ERR_PTR(pcibios_err_to_errno(rc));
 }
 
+/*
+ * Snapshot committed decoders into pdev->coh_resource[], called once per
+ * pdev before any driver can bind, so a populated entry is always
+ * firmware-committed and not driver-committed.
+ *
+ * Unlike pdev->resource[], coh_resource[] isn't walked by PCI
+ * resource-assignment code, so insert each entry into iomem_resource
+ * ourselves for /proc/iomem visibility and conflict detection.
+ */
+static void cxl_populate_coh_resource(struct pci_dev *pdev,
+				      struct cxl_hdm_info *info)
+{
+	int count = min(info->decoder_count, PCI_CXL_MAX_COHERENT_RANGES);
+
+	for (int i = 0; i < count; i++) {
+		struct cxl_decoder_config *config = &info->settings[i].config;
+		struct resource *res = &pdev->coh_resource[i];
+		struct resource *conflict;
+
+		if (!(config->flags & CXL_DECODER_F_ENABLE))
+			continue;
+
+		*res = DEFINE_RES_NAMED_DESC(config->hpa_range.start,
+					     range_len(&config->hpa_range),
+					     "CXL coherent memory",
+					     IORESOURCE_MEM, IORES_DESC_NONE);
+
+		conflict = insert_resource_conflict(&iomem_resource, res);
+		if (conflict) {
+			pci_warn(pdev,
+				 "CXL coherent range: decoder%d %pR conflicts with %s %pR, leaving unpopulated\n",
+				 i, res, conflict->name, conflict);
+			memset(res, 0, sizeof(*res));
+			continue;
+		}
+
+		pci_info(pdev, "CXL coherent range: decoder%d precommitted, populated %pR\n",
+			 i, res);
+	}
+}
+
 static int __pci_cxl_hdm_cache_init(struct pci_dev *pdev)
 {
 	struct cxl_register_map map = { };
@@ -442,8 +483,10 @@ static int __pci_cxl_hdm_cache_init(struct pci_dev *pdev)
 	struct cxl_hdm_info *info __free(kfree) = read_info;
 	guard(rwsem_write)(&cxl_rwsem.dpa);
 	/* Another initializer may have published while we read MMIO. */
-	if (!pdev->hdm)
+	if (!pdev->hdm) {
+		cxl_populate_coh_resource(pdev, info);
 		pdev->hdm = no_free_ptr(info);
+	}
 
 	return 0;
 }
@@ -466,6 +509,14 @@ void pci_cxl_hdm_cache_release(struct pci_dev *pdev)
 	info = pdev->hdm;
 	/* Unpublish before freeing so subsequent readers cannot use stale state. */
 	pdev->hdm = NULL;
+
+	for (int i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
+		struct resource *res = &pdev->coh_resource[i];
+
+		if (res->parent)
+			remove_resource(res);
+	}
+
 	kfree(info);
 }
 
