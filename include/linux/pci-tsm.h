@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __PCI_TSM_H
 #define __PCI_TSM_H
+#include <linux/bits.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/range.h>
 #include <linux/sockptr.h>
 
 struct pci_tsm;
@@ -199,15 +201,20 @@ enum pci_tsm_req_scope {
 	PCI_TSM_REQ_DEBUG_WRITE = 3,
 };
 
+/* The range is the device's CXL coherent (CXL.mem) window, not BAR-backed */
+#define PCI_TSM_MMIO_F_COHERENT BIT(0)
+
 /**
  * struct pci_tsm_mmio_entry - an encrypted MMIO range
  * @res: MMIO address range (typically Guest Physical Address, GPA)
  * @tsm_offset: Host Physical Address, HPA obfuscation offset added by the TSM.
  *		Translates report addresses to GPA.
+ * @flags: PCI_TSM_MMIO_F_* attributes for the range
  */
 struct pci_tsm_mmio_entry {
 	struct resource res;
 	u64 tsm_offset;
+	u32 flags;
 };
 
 struct pci_tsm_mmio {
@@ -226,6 +233,74 @@ static inline struct resource *pci_tsm_mmio_resource(struct pci_tsm_mmio *mmio,
 {
 	return &mmio->mmio[idx].res;
 }
+
+#ifdef CONFIG_PCI_TSM_CXL_COHERENT
+/*
+ * pci_tsm_coh_resource_contains() - check a coherent range against the
+ * PCI-core coh_resource[] snapshot
+ * @pdev: device owner of @res
+ * @res: candidate coherent MMIO range to validate
+ *
+ * The coherent (CXL.mem) range isn't BAR-backed. So pci_resource_n()
+ * containment doesn't apply. Check against pdev->coh_resource[] instead.
+ *
+ * Return: true if @res falls within a populated coh_resource[] entry.
+ */
+static inline bool pci_tsm_coh_resource_contains(struct pci_dev *pdev,
+						 const struct resource *res)
+{
+	for (int i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
+		struct resource *coh_res = &pdev->coh_resource[i];
+
+		if (resource_type(coh_res) == IORESOURCE_MEM &&
+		    resource_contains(coh_res, res))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * pci_tsm_retrieve_coherent_range() - resolve the device's coherent CXL window
+ * @pdev: device owner of the reported ranges
+ * @out: host physical (guest IPA) range of the coherent window
+ *
+ * The coherent range carries no BAR number, so its address comes from
+ * pdev->coh_resource[], a pre-driver-bind snapshot of committed CXL HDM
+ * decoders.
+ *
+ * Return: 0 with *@out set from the first populated entry, or -ENODEV if no
+ * entry is populated.
+ */
+static inline int pci_tsm_retrieve_coherent_range(struct pci_dev *pdev,
+						  struct range *out)
+{
+	for (int i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
+		struct resource *res = &pdev->coh_resource[i];
+
+		if (resource_type(res) != IORESOURCE_MEM)
+			continue;
+
+		out->start = res->start;
+		out->end = res->end;
+		return 0;
+	}
+
+	return -ENODEV;
+}
+#else
+static inline bool pci_tsm_coh_resource_contains(struct pci_dev *pdev,
+						 const struct resource *res)
+{
+	return false;
+}
+
+static inline int pci_tsm_retrieve_coherent_range(struct pci_dev *pdev,
+						  struct range *out)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_PCI_TSM_CXL_COHERENT */
 
 #ifdef CONFIG_PCI_TSM
 int pci_tsm_register(struct tsm_dev *tsm_dev);

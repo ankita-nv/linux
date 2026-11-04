@@ -939,8 +939,9 @@ int pci_tsm_mmio_setup(struct pci_dev *pdev, struct pci_tsm_mmio *mmio)
 		return -EBUSY;
 
 	for (i = 0; i < mmio->nr; i++) {
-		struct resource *res = pci_tsm_mmio_resource(mmio, i);
-		int j;
+		struct pci_tsm_mmio_entry *entry = pci_tsm_mmio_entry(mmio, i);
+		struct resource *res = &entry->res;
+		bool coherent = entry->flags & PCI_TSM_MMIO_F_COHERENT;
 
 		if (resource_size(res) == 0 || !(res->flags & IORESOURCE_MEM))
 			break;
@@ -950,13 +951,28 @@ int pci_tsm_mmio_setup(struct pci_dev *pdev, struct pci_tsm_mmio *mmio)
 					     pci_name(pdev), IORESOURCE_MEM,
 					     IORES_DESC_ENCRYPTED);
 
-		for (j = 0; j < PCI_NUM_RESOURCES; j++)
-			if (resource_contains(pci_resource_n(pdev, j), res))
+		/*
+		 * The coherent (CXL.mem) range isn't BAR-backed, so check it
+		 * against pdev->coh_resource[] instead of pci_resource_n().
+		 */
+		if (coherent) {
+			if (!pci_tsm_coh_resource_contains(pdev, res))
 				break;
+		} else {
+			struct resource *r;
+			bool contained = false;
 
-		/* Request is outside of device MMIO */
-		if (j >= PCI_NUM_RESOURCES)
-			break;
+			pci_dev_for_each_resource(pdev, r) {
+				if (resource_contains(r, res)) {
+					contained = true;
+					break;
+				}
+			}
+
+			/* Request is outside of device MMIO */
+			if (!contained)
+				break;
+		}
 
 		if (insert_resource(&encrypted_iomem_resource, res) != 0)
 			break;
@@ -988,6 +1004,7 @@ EXPORT_SYMBOL_GPL(pci_tsm_mmio_teardown);
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_NON_TEE BIT(2)
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_UPDATABLE BIT(3)
 #define PCI_TSM_DEVIF_REPORT_MMIO_ATTR_RANGE_ID GENMASK(31, 16)
+#define PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_COHERENT 0xffff
 
 /* An interface report 'pfn' is 4K in size */
 struct pci_tsm_devif_mmio {
@@ -1043,6 +1060,7 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev,
 		return NULL;
 
 	for (i = 0; i < mmio_range_count; i++) {
+		struct range window;
 		u64 range_off;
 		struct range range;
 		const struct pci_tsm_devif_mmio *mmio_data = &devif_report->mmio[i];
@@ -1053,33 +1071,58 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev,
 		u32 attr = __le32_to_cpu(mmio_data->attributes);
 		int bar = FIELD_GET(PCI_TSM_DEVIF_REPORT_MMIO_ATTR_RANGE_ID,
 				    attr);
+		bool coherent =
+			bar == PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_COHERENT;
 
-		if (bar >= PCI_STD_NUM_BARS ||
-		    !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM) ||
-		    (pci_resource_flags(pdev, bar) & IORESOURCE_UNSET)) {
-			pci_dbg(pdev, "Invalid reporting bar ID %d\n", bar);
-			return NULL;
-		}
-
-		if (last_bar > bar) {
-			pci_dbg(pdev, "Reporting bar ID not in ascending order\n");
-			return NULL;
-		}
-
-		if (last_bar < bar) {
-			resource_size_t mask = pci_resource_len(pdev, bar) - 1;
-
-			/* Transition to a new bar */
-			last_bar = bar;
+		if (coherent) {
+			if (i != mmio_range_count - 1) {
+				pci_dbg(pdev, "Coherent reporting range is not last\n");
+				return NULL;
+			}
 
 			/*
-			 * Determine the obfuscated base of the BAR. BAR
-			 * offsets are never obfuscated.
+			 * No BAR names the coherent range, so fail closed if
+			 * neither a CXL region nor a committed HDM decoder
+			 * resolves its address.
 			 */
-			reporting_bar_base = tsm_offset & ~mask;
-		} else if (tsm_offset < last_reporting_end) {
-			pci_dbg(pdev, "Reporting ranges within BAR not in ascending order\n");
-			return NULL;
+			if (pci_tsm_retrieve_coherent_range(pdev, &window)) {
+				pci_dbg(pdev, "No CXL region or committed HDM decoder for coherent reporting range\n");
+				return NULL;
+			}
+
+			reporting_bar_base = tsm_offset &
+					     ~((u64)range_len(&window) - 1);
+		} else {
+			if (bar >= PCI_STD_NUM_BARS ||
+			    !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM) ||
+			    (pci_resource_flags(pdev, bar) & IORESOURCE_UNSET)) {
+				pci_dbg(pdev, "Invalid reporting bar ID %d\n", bar);
+				return NULL;
+			}
+
+			if (last_bar > bar) {
+				pci_dbg(pdev, "Reporting bar ID not in ascending order\n");
+				return NULL;
+			}
+
+			if (last_bar < bar) {
+				resource_size_t mask = pci_resource_len(pdev, bar) - 1;
+
+				/* Transition to a new bar */
+				last_bar = bar;
+
+				/*
+				 * Determine the obfuscated base of the BAR. BAR
+				 * offsets are never obfuscated.
+				 */
+				reporting_bar_base = tsm_offset & ~mask;
+			} else if (tsm_offset < last_reporting_end) {
+				pci_dbg(pdev, "Reporting ranges within BAR not in ascending order\n");
+				return NULL;
+			}
+
+			window.start = pci_resource_start(pdev, bar);
+			window.end = pci_resource_end(pdev, bar);
 		}
 
 		/* Per spec the tsm_offset never results in overflow / underflow */
@@ -1090,19 +1133,21 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev,
 		}
 
 		range_off = tsm_offset - reporting_bar_base;
-		if (pci_resource_len(pdev, bar) < range_off + size) {
-			pci_dbg(pdev, "Reporting range larger than BAR size\n");
+
+		if (range_len(&window) < range_off + size) {
+			pci_dbg(pdev, "Reporting range larger than %s size\n",
+				coherent ? "coherent range" : "BAR");
 			return NULL;
 		}
 
-		range.start = pci_resource_start(pdev, bar) + range_off;
+		range.start = window.start + range_off;
 		range.end = range.start + size - 1;
 
 		/* Only record the TEE ranges for later consideration by ioremap() */
 		if (FIELD_GET(PCI_TSM_DEVIF_REPORT_MMIO_ATTR_IS_NON_TEE,
 			      attr)) {
-			pci_dbg(pdev, "Skipping non-TEE range, BAR%d %pra\n",
-				bar, &range);
+			pci_dbg(pdev, "Skipping non-TEE range, %s %pra\n",
+				coherent ? "coherent range" : "BAR", &range);
 			continue;
 		}
 
@@ -1110,6 +1155,8 @@ struct pci_tsm_mmio *pci_tsm_mmio_alloc(struct pci_dev *pdev,
 		entry->res.end = range.end;
 		entry->res.flags = IORESOURCE_MEM;
 		entry->tsm_offset = tsm_offset;
+		if (coherent)
+			entry->flags |= PCI_TSM_MMIO_F_COHERENT;
 		mmio->nr++;
 	}
 

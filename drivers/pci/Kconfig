@@ -139,6 +139,16 @@ config PCI_TSM
 
 	  Enable a platform TSM driver to use this capability.
 
+config PCI_TSM_CXL_COHERENT
+	bool "PCI TSM: CXL coherent range support"
+	depends on PCI_TSM && CXL_RESET
+	default y
+	help
+	  CXL coherent (CXL.mem) ranges are present and reported in a TDISP
+	  Device Interface Report.
+
+	  If unsure, say Y.
+
 config PCI_DOE
 	bool "Enable PCI Data Object Exchange (DOE) support"
 	help
