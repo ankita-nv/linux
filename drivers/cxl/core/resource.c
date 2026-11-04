@@ -527,6 +527,38 @@ void pci_cxl_hdm_cache_release(struct pci_dev *pdev)
 	kfree(info);
 }
 
+/*
+ * A decoder is found to use Normalized Addressing only once the endpoint is
+ * assembled into a region, after the snapshot. Record the flag in the cached
+ * settings and drop the coherent range so a DPA is never reported as an HPA.
+ */
+void pci_cxl_hdm_coh_invalidate(struct pci_dev *pdev, int decoder_id)
+{
+	struct cxl_hdm_info *info;
+	struct resource *res;
+
+	guard(rwsem_write)(&cxl_rwsem.dpa);
+	info = pdev->hdm;
+	if (!info || decoder_id < 0 || decoder_id >= info->decoder_count)
+		return;
+
+	info->settings[decoder_id].config.flags |=
+		CXL_DECODER_F_NORMALIZED_ADDRESSING;
+
+	if (decoder_id >= PCI_CXL_MAX_COHERENT_RANGES)
+		return;
+
+	res = &pdev->coh_resource[decoder_id];
+	if (!res->flags)
+		return;
+
+	pci_warn(pdev, "CXL coherent range: decoder%d uses Normalized Addressing, dropping %pR\n",
+		 decoder_id, res);
+	if (res->parent)
+		remove_resource(res);
+	memset(res, 0, sizeof(*res));
+}
+
 static void __iomem *cxl_pci_hdm_ioremap_current(struct pci_dev *pdev,
 						 int bar,
 						 resource_size_t offset,

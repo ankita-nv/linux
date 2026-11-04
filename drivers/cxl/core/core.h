@@ -139,6 +139,15 @@ struct cxl_rwsem {
 
 extern struct cxl_rwsem cxl_rwsem;
 
+#ifdef CONFIG_CXL_RESET
+void pci_cxl_hdm_coh_invalidate(struct pci_dev *pdev, int decoder_id);
+#else
+static inline void pci_cxl_hdm_coh_invalidate(struct pci_dev *pdev,
+					      int decoder_id)
+{
+}
+#endif
+
 void cxl_commit_start(void __iomem *hdm, struct cxl_decoder_settings *settings);
 int cxld_await_commit(void __iomem *hdm, int id);
 

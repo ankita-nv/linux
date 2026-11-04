@@ -175,6 +175,12 @@ static int cxl_prm_setup_root(struct cxl_root *cxl_root, void *data)
 	cxld->config.flags |= CXL_DECODER_F_LOCK;
 	cxld->config.flags |= CXL_DECODER_F_NORMALIZED_ADDRESSING;
 
+	/*
+	 * The PCI-core snapshot of this decoder was taken before the flag was
+	 * known. Invalidate it so a DPA is never exposed as a coherent HPA.
+	 */
+	pci_cxl_hdm_coh_invalidate(pci_dev, cxld->config.id);
+
 	ctx->hpa_range = hpa_range;
 	ctx->interleave_ways = ways;
 	ctx->interleave_granularity = gran;
