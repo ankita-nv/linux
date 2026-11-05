@@ -261,32 +261,35 @@ static inline bool pci_tsm_coh_resource_contains(struct pci_dev *pdev,
 }
 
 /*
- * pci_tsm_retrieve_coherent_range() - resolve the device's coherent CXL window
+ * pci_tsm_retrieve_coherent_range() - resolve the device coherent CXL window
  * @pdev: device owner of the reported ranges
+ * @coh_idx: which coherent range to resolve, per
+ *	     %PCI_TSM_DEVIF_REPORT_MMIO_RANGE_ID_TO_COH_IDX()
  * @out: host physical (guest IPA) range of the coherent window
  *
- * The coherent range carries no BAR number, so its address comes from
- * pdev->coh_resource[], a pre-driver-bind snapshot of committed CXL HDM
- * decoders.
+ * Each @coh_idx names one of the device coherent (CXL) windows. It carries
+ * no BAR number and so its address comes from pdev->coh_resource[@coh_idx],
+ * which is a snapshot of committed CXL HDM decoders regions.
  *
- * Return: 0 with *@out set from the first populated entry, or -ENODEV if no
- * entry is populated.
+ * Return: 0 with *@out set, or -ENODEV if @coh_idx is out
+ * of range or has no populated coh_resource[] entry.
  */
 static inline int pci_tsm_retrieve_coherent_range(struct pci_dev *pdev,
+						  unsigned int coh_idx,
 						  struct range *out)
 {
-	for (int i = 0; i < PCI_CXL_MAX_COHERENT_RANGES; i++) {
-		struct resource *res = &pdev->coh_resource[i];
+	struct resource *res;
 
-		if (resource_type(res) != IORESOURCE_MEM)
-			continue;
+	if (coh_idx >= PCI_CXL_MAX_COHERENT_RANGES)
+		return -ENODEV;
 
-		out->start = res->start;
-		out->end = res->end;
-		return 0;
-	}
+	res = &pdev->coh_resource[coh_idx];
+	if (resource_type(res) != IORESOURCE_MEM)
+		return -ENODEV;
 
-	return -ENODEV;
+	out->start = res->start;
+	out->end = res->end;
+	return 0;
 }
 #else
 static inline bool pci_tsm_coh_resource_contains(struct pci_dev *pdev,
@@ -296,6 +299,7 @@ static inline bool pci_tsm_coh_resource_contains(struct pci_dev *pdev,
 }
 
 static inline int pci_tsm_retrieve_coherent_range(struct pci_dev *pdev,
+						  unsigned int coh_idx,
 						  struct range *out)
 {
 	return -ENODEV;
